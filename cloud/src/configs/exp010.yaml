@@ -1,0 +1,44 @@
+general:
+  project_name: 202309-rsna-atd
+  exp_name: exp010
+  input_path: data
+  output_path: models
+  seed: 42
+  use_wandb: true
+
+data:
+  n_folds: 5
+  # fold_i: [0, 1, 2, 3, 4]
+  fold_i: [0]
+  batch_size: 16
+  batch_size_inference: not used # 16
+  kls_slice_start: not used # 0.6
+  b_e_slice_start: not used
+  kls_stride: not used # 4
+  b_e_stride_inference: not used
+  apply_aug: true
+  calc_cv_score: false
+
+model:
+  model_type: b_e # kls, b_e
+  model_name: tf_efficientnetv2_s
+  pretrained: true
+  in_chans: 1
+  num_classes: 0 # to use as backbone
+  global_pool: max
+  drop_rate: 0.8
+  drop_path_rate: 0.2
+
+  kls_weights: [1.0, 8.0, 16.0] # healty, low, high
+  b_weights: [1.0, 8.0] # healthy, injury
+  e_weights: [1.0, 24.0] # healthy, injury
+  hidden_dim: 128
+  p_dropout: 0.3
+
+  lr: 1.0e-4
+
+pl_params:
+  accelerator: auto
+  max_epochs: 10
+  precision: 16 # 16 or 32
+  enable_progress_bar: true
