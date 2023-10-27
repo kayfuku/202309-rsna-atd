@@ -307,3 +307,240 @@ class AbdominalBEData(Dataset):
         train_data = Subset(self, train_indices)
         val_data = Subset(self, val_indices)
         return train_data, val_data
+
+
+# Model Architecure
+class KLSNet(pl.LightningModule):
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.backbone = timm.create_model(
+            model_name=cfg['model']['model_name'],
+            pretrained=cfg['model']['pretrained'],
+            in_chans=cfg['model']['in_chans'],
+            num_classes=cfg['model']['num_classes'],
+            global_pool=cfg['model']['global_pool'],
+            drop_rate=cfg["model"]["drop_rate"],
+            drop_path_rate=cfg["model"]["drop_path_rate"],
+        )
+        # for param in self.backbone.parameters():
+        #     param.requires_grad = False
+
+        self.in_features = self.backbone.num_features  # 1280
+        hidden_dim = cfg['model']['hidden_dim']
+        self.neck = nn.Sequential(
+            nn.Linear(self.in_features, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(cfg['model']['p_dropout']),
+        )
+
+        self.kidney = nn.Linear(hidden_dim, 3)
+        self.liver = nn.Linear(hidden_dim, 3)
+        self.spleen = nn.Linear(hidden_dim, 3)
+
+        self.cce = nn.CrossEntropyLoss(label_smoothing=0.05, weight=torch.tensor(cfg['model']['kls_weights']))
+
+        self.train_epoch_loss = []
+        self.val_epoch_loss = []
+        self.probs = defaultdict(list)
+        self.targets = defaultdict(list)
+        self.auc_scores = dict()
+
+    def forward(self, x):
+        # extract features
+        x = self.backbone(x)
+        x = self.neck(x)
+
+        # output logits
+        kidney = self.kidney(x)
+        liver = self.liver(x)
+        spleen = self.spleen(x)
+
+        return kidney, liver, spleen
+
+    def training_step(self, batch, batch_idx):
+        inputs = batch['image']
+        kidney = batch['kidney']
+        liver = batch['liver']
+        spleen = batch['spleen']
+
+        k, l, s = self.forward(inputs)
+        k_loss = self.cce(k, kidney)
+        l_loss = self.cce(l, liver)
+        s_loss = self.cce(s, spleen)
+        loss = k_loss + l_loss + s_loss
+        self.train_epoch_loss.append(loss.item())
+
+        self.log('train_loss', loss, prog_bar=True, logger=True, on_epoch=True, on_step=True, sync_dist=True)
+        return loss
+
+    # def on_train_epoch_end(self):
+    #     avg_loss = np.mean(self.train_epoch_loss)
+    #     self.log('avg_train_loss', avg_loss, prog_bar=True)
+    #     self.train_epoch_loss.clear()
+
+    def validation_step(self, batch, batch_idx):
+        inputs = batch['image']
+        kidney = batch['kidney']
+        liver = batch['liver']
+        spleen = batch['spleen']
+
+        k, l, s = self.forward(inputs)
+        k_loss = self.cce(k, kidney)
+        l_loss = self.cce(l, liver)
+        s_loss = self.cce(s, spleen)
+        loss = k_loss + l_loss + s_loss
+        self.val_epoch_loss.append(loss.item())
+
+        self.probs['k'].extend(F.softmax(k, dim=1).detach().cpu().numpy())
+        self.probs['l'].extend(F.softmax(l, dim=1).detach().cpu().numpy())
+        self.probs['s'].extend(F.softmax(s, dim=1).detach().cpu().numpy())
+        self.targets['k'].extend(kidney.detach().cpu().numpy())
+        self.targets['l'].extend(liver.detach().cpu().numpy())
+        self.targets['s'].extend(spleen.detach().cpu().numpy())
+
+        self.log('val_loss', loss, prog_bar=True, logger=True, on_epoch=True, on_step=True, sync_dist=True)
+        return loss
+
+    def on_validation_epoch_end(self):
+        avg_loss = np.mean(self.val_epoch_loss)
+
+        for t in ['k', 'l', 's']:
+            self.auc_scores[t] = roc_auc_score(
+                self.targets.get(t),
+                self.probs.get(t),
+                multi_class='ovo', labels=[0, 1, 2])
+
+        # self.log('avg_val_loss', avg_loss, prog_bar=True)
+        self.log('val_auc_score_k', self.auc_scores.get('k'), prog_bar=True, sync_dist=True)
+        self.log('val_auc_score_l', self.auc_scores.get('l'), prog_bar=True, sync_dist=True)
+        self.log('val_auc_score_s', self.auc_scores.get('s'), prog_bar=True, sync_dist=True)
+        self.val_epoch_loss.clear()
+        self.probs.clear()
+        self.targets.clear()
+        self.auc_scores.clear()
+
+    def configure_optimizers(self):
+        optimizer = AdamW(self.parameters(), lr=float(self.cfg['model']['lr']))
+        # optimizer = AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=float(self.cfg['model']['lr']))
+        return optimizer
+
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        pass
+
+
+# Model Architecure
+class BENet(pl.LightningModule):
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.backbone = timm.create_model(
+            model_name=cfg['model']['model_name'],
+            pretrained=cfg['model']['pretrained'],
+            in_chans=cfg['model']['in_chans'],
+            num_classes=cfg['model']['num_classes'],
+            global_pool=cfg['model']['global_pool'],
+            drop_rate=cfg["model"]["drop_rate"],
+            drop_path_rate=cfg["model"]["drop_path_rate"],
+        )
+        # for param in self.backbone.parameters():
+        #     param.requires_grad = False
+
+        self.in_features = self.backbone.num_features  # 1280
+        hidden_dim = cfg['model']['hidden_dim']
+        self.neck = nn.Sequential(
+            nn.Linear(self.in_features, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(cfg['model']['p_dropout']),
+        )
+
+        self.bowel = nn.Linear(hidden_dim, 2)
+        self.extravasation = nn.Linear(hidden_dim, 2)
+
+        self.cce_b = nn.CrossEntropyLoss(label_smoothing=0.05, weight=torch.tensor(cfg['model']['b_weights']))
+        self.cce_e = nn.CrossEntropyLoss(label_smoothing=0.05, weight=torch.tensor(cfg['model']['e_weights']))
+
+        self.train_epoch_loss = []
+        self.val_epoch_loss = []
+        self.probs = defaultdict(list)
+        self.targets = defaultdict(list)
+        self.auc_scores = dict()
+
+    def forward(self, x):
+        # extract features
+        x = self.backbone(x)
+        x = self.neck(x)
+
+        # output logits
+        bowel = self.bowel(x)
+        extravsation = self.extravasation(x)
+
+        return bowel, extravsation
+
+    def training_step(self, batch, batch_idx):
+        inputs = batch['image']
+        bowel = batch['bowel']
+        extravasation = batch['extravasation']
+
+        b, e = self.forward(inputs)
+        b_loss = self.cce_b(b, bowel)
+        e_loss = self.cce_e(e, extravasation)
+        loss = b_loss + e_loss
+        self.train_epoch_loss.append(loss.item())
+
+        self.log('train_loss', loss, prog_bar=True, logger=True, on_epoch=True, on_step=True, sync_dist=True)
+        return loss
+
+    # def on_train_epoch_end(self):
+    #     avg_loss = np.mean(self.train_epoch_loss)
+    #     self.log('avg_train_loss', avg_loss, prog_bar=True)
+    #     self.train_epoch_loss.clear()
+
+    def validation_step(self, batch, batch_idx):
+        inputs = batch['image']
+        bowel = batch['bowel']
+        extravasation = batch['extravasation']
+
+        b, e = self.forward(inputs)
+        b_loss = self.cce_b(b, bowel)
+        e_loss = self.cce_e(e, extravasation)
+        loss = b_loss + e_loss
+        self.val_epoch_loss.append(loss.item())
+
+        self.probs['b'].extend(F.softmax(b, dim=1).detach().cpu().numpy())
+        self.probs['e'].extend(F.softmax(e, dim=1).detach().cpu().numpy())
+        self.targets['b'].extend(bowel.detach().cpu().numpy())
+        self.targets['e'].extend(extravasation.detach().cpu().numpy())
+
+        self.log('val_loss', loss, prog_bar=True, logger=True, on_epoch=True, on_step=True, sync_dist=True)
+        return loss
+
+    def on_validation_epoch_end(self):
+        avg_loss = np.mean(self.val_epoch_loss)
+
+        for t in ['b', 'e']:
+            y_true = np.ravel(self.targets.get(t))
+            prob_array = np.array(self.probs.get(t))
+            if len(np.unique(y_true)) != 2:
+                return -1
+            self.auc_scores[t] = roc_auc_score(y_true, prob_array[:, 1])
+
+        # self.log('avg_val_loss', avg_loss, prog_bar=True)
+        self.log('val_auc_score_b', self.auc_scores.get('b'), prog_bar=True, sync_dist=True)
+        self.log('val_auc_score_e', self.auc_scores.get('e'), prog_bar=True, sync_dist=True)
+        self.val_epoch_loss.clear()
+        self.probs.clear()
+        self.targets.clear()
+        self.auc_scores.clear()
+
+    def configure_optimizers(self):
+        optimizer = AdamW(self.parameters(), lr=float(self.cfg['model']['lr']))
+        # optimizer = AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=float(self.cfg['model']['lr']))
+        return optimizer
+
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        pass
+        
+
